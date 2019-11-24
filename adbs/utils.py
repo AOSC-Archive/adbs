@@ -1,6 +1,5 @@
 import re
 import sys
-import enum
 import json
 import time
 import pathlib
@@ -71,8 +70,10 @@ class DependencyWarning(BuildWarning):
     pass
 
 
-class Colors(enum.Enum):
+class ANSIEscapes:
     ANSI_RST = '\033[0m'
+    ANSI_BOLD = '\033[1m'
+    ANSI_ULINE = '\033[4m'
     ANSI_RED = '\033[91m'
     ANSI_BLNK = '\033[5m'
     ANSI_CYAN = '\033[36m'
@@ -81,6 +82,13 @@ class Colors(enum.Enum):
     ANSI_YELLOW = '\033[93m'
     ANSI_BLUE = '\033[34m'
     ANSI_BROWN = '\033[33m'
+
+
+def comma_list(l, color=None):
+    if color:
+        return ', '.join('%s%s%s' % (color, x, ANSIEscapes.ANSI_RST) for x in l)
+    else:
+        return ', '.join(l)
 
 
 def touch(filename):
@@ -151,56 +159,46 @@ def uniq(seq):  # Dave Kirby
     return [x for x in seq if x not in seen and not seen.add(x)]
 
 
-def list2str(list_in, sep=' '):
-    """
-    A simple conversion function to format `list` to `string` with given \
-    seperator
-
-    :param list_in: A list that needed to be formatted
-    :param sep: Seperator, default is a single non-breaking space `' '`
-    :returns: A formatted string
-    :raises TypeError: `list_in` must be of `list` type
-    """
-    return sep.join(map(str, list_in))
+class CircularDependencyError(ValueError):
+    def __init__(self, data):
+        s = 'Circular dependencies exist among these items: {%s}' % (
+            ', '.join('{!r}:{!r}'.format(key, value)
+            for key, value in sorted(data.items())))
+        super(CircularDependencyError, self).__init__(s)
+        self.data = data
 
 
-def gen_laundry_list(items):
-    """
-    Generate a laundry list for Bash to interpret
+def toposort(data):
+    if not data:
+        return
+    # normalize data
+    #data = {k: data.get(k, set()).difference(set((k,))) for k in
+        #functools.reduce(set.union, data.values(), set(data.keys()))}
+    # we don't need this
+    data = data.copy()
+    while True:
+        ordered = set(item for item, dep in data.items() if not dep)
+        if not ordered:
+            break
+        yield sorted(ordered)
+        data = {item: (dep - ordered) for item, dep in data.items()
+                if item not in ordered}
+    if data:
+        raise CircularDependencyError(data)
 
-    :param items: An array representing objects that needed to be collected \
-    and interpreted
-    :returns: A string which is a small Bash snipplet for interpreting.
-    """
-    # You know what, 'laundry list' can be a joke in somewhere...
-    str_out = '\n\n'
-    for i in items:
-        str_out += 'echo \"%s\"=\"${%s}\"\n' % (i, i)
-        # For example: `echo "VAR"="${VAR}"\n`
-    return str_out
 
+class FileRemover:
+    def __init__(self):
+        self.weak_references = dict()  # weak_ref -> filepath to remove
 
-def test_progs(cmd, display=False):
-    """
-    Test if the given external program can run without flaw
+    def cleanup_once_done(self, response, filepath):
+        wr = weakref.ref(response, self._do_cleanup)
+        self.weak_references[wr] = filepath
 
-    :param cmd: A list, the command-line arguments
-    :param display: Whether to be displayed in the terminal
-    :returns: Whether the external program exited successfully
-    """
-    try:
-        if display is False:
-            # _ = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            _, _ = proc.communicate()
-            # Maybe one day we'll need its output...?
-        else:
-            subprocess.check_call(cmd)
-    except Exception:
-        return False
-
-    return True
+    def _do_cleanup(self, wr):
+        filepath = self.weak_references[wr]
+        # shutil.rmtree(filepath, ignore_errors=True)
+        os.unlink(filepath)
 
 
 def merge_dicts(*dict_args):
@@ -243,17 +241,6 @@ def get_arch_name():
     return None
 
 
-def str_split_to_list(str_in, sep=' '):
-    """
-    A simple stupid function to split strings
-
-    :param str_in: A string to be splitted
-    :param sep: Seperator
-    :returns: A list
-    """
-    return list(filter(None, str_in.split(sep)))
-
-
 def err_msg(desc=None):
     """
     Print error message
@@ -269,35 +256,6 @@ def err_msg(desc=None):
             'Error occurred:\033[93m {} \033[0m'.format(desc))
 
 
-def group_match(pattern_list, string, logic_method):
-    """
-    Match multiple patterns in one go.
-
-    :param pattern_list: A list contains patterns to be used
-    :param string: A string to be tested against
-    :param logic_method: 1= OR'ed logic, 2= AND'ed logic
-    :returns: Boolean, the test result
-    :raises ValueError: pattern_list should be a `list` object, and \
-    logic_method should be 1 or 2.
-    """
-    import re
-    if not isinstance(pattern_list, list):
-        raise ValueError()
-    if logic_method == 1:
-        for i in pattern_list:
-            if re.match(i, string):
-                return True
-        return False
-    elif logic_method == 2:
-        for i in pattern_list:
-            if not re.match(i, string):
-                return False
-        return True
-    else:
-        raise ValueError('...')
-        return False
-
-
 def full_line_banner(msg, char='-'):
     """
     Print a full line banner with customizable texts
@@ -308,38 +266,6 @@ def full_line_banner(msg, char='-'):
     bars_count = int((shutil.get_terminal_size().columns - len(msg) - 2) / 2)
     bars = char*bars_count
     return ' '.join((bars, msg, bars))
-
-
-def random_msg():
-
-    return ''
-
-
-def sh_executor(sh_file, function, args, display=False):
-    """
-    Execute specified functions in external shell scripts with given args
-
-    :param file: The full path to the script file
-    :param function: The function need to be excute_code
-    :param: args: The arguments that need to be passed to the function
-    :param display: Wether return script output or display on screen
-    :returns: Return if excution succeeded or return output per requested
-    :raise FileNotFoundError: If script file doesn't exist, raise this.
-    """
-    with open(sh_file, 'rt') as f:
-        sh_code = f.read()
-    excute_code = '%s\n%s %s\n' % (sh_code, function, args)
-    if display:
-        try:
-            subprocess.check_call(excute_code, shell=True)
-        except subprocess.CalledProcessError:
-            return False
-        return True
-    else:
-        outs, errs = subprocess.Popen(
-            ('bash',), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE).communicate(excute_code.encode('utf-8'))
-    return outs.decode('utf-8')
 
 
 def acbs_terminate(exit_code):
@@ -375,7 +301,7 @@ def human_time(full_seconds):
     out_str_tmp = '{}'.format(
         datetime.timedelta(seconds=full_seconds))
     out_str = out_str_tmp.replace(
-        ':', ('{}:{}'.format(Colors.ANSI_GREEN, Colors.ANSI_RST)))
+        ':', ('{}:{}'.format(ANSIEscapes.ANSI_GREEN, ANSIEscapes.ANSI_RST)))
     return out_str
 
 
@@ -390,23 +316,6 @@ def format_column(data):
 
 def format_packages(*packages):
     return ', '.join('\033[36m%s\033[0m' % p for p in packages)
-
-
-class ACBSVariables(object):
-
-    buffer = {}
-
-    def __init__(self):
-        return
-
-    @classmethod
-    def get(cls, var_name):
-        return cls.buffer.get(var_name)
-
-    @classmethod
-    def set(cls, var_name, value):
-        cls.buffer[var_name] = value
-        return
 
 
 class ExternalLogFilter(logging.Filter):
@@ -438,13 +347,13 @@ class ACBSColorFormatter(logging.Formatter):
     def format(self, record):
         # FIXME: Let's come up with a way to simplify this ****
         lvl_map = {
-            'WARNING': '{}WARN{}'.format(Colors.ANSI_BROWN, Colors.ANSI_RST),
-            'INFO': '{}INFO{}'.format(Colors.ANSI_LT_CYAN, Colors.ANSI_RST),
-            'DEBUG': '{}DEBUG{}'.format(Colors.ANSI_GREEN, Colors.ANSI_RST),
-            'ERROR': '{}ERROR{}'.format(Colors.ANSI_RED, Colors.ANSI_RST),
-            'CRITICAL': '{}CRIT{}'.format(Colors.ANSI_YELLOW, Colors.ANSI_RST)
-            # 'FATAL': '{}{}WTF{}'.format(Colors.ANSI_BLNK, Colors.ANSI_RED,
-            # Colors.ANSI_RST),
+            'WARNING': '{}WARN{}'.format(ANSIEscapes.ANSI_BROWN, ANSIEscapes.ANSI_RST),
+            'INFO': '{}INFO{}'.format(ANSIEscapes.ANSI_LT_CYAN, ANSIEscapes.ANSI_RST),
+            'DEBUG': '{}DEBUG{}'.format(ANSIEscapes.ANSI_GREEN, ANSIEscapes.ANSI_RST),
+            'ERROR': '{}ERROR{}'.format(ANSIEscapes.ANSI_RED, ANSIEscapes.ANSI_RST),
+            'CRITICAL': '{}CRIT{}'.format(ANSIEscapes.ANSI_YELLOW, ANSIEscapes.ANSI_RST)
+            # 'FATAL': '{}{}WTF{}'.format(ANSIEscapes.ANSI_BLNK, ANSIEscapes.ANSI_RED,
+            # ANSIEscapes.ANSI_RST),
         }
         if record.levelno in (logging.WARNING, logging.ERROR, logging.CRITICAL,
                               logging.INFO, logging.DEBUG):

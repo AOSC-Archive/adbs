@@ -15,14 +15,6 @@ from . import utils
 from . import abbsmeta
 
 
-class SuiteBuildRecipe(typing.NamedTuple):
-    input_names: list
-    src_packages: list
-    dependencies: dict
-    installed: list
-    build_list: list
-
-
 class PackageBuildResult(typing.NamedTuple):
     src_name: str  # base-devel/llvm
     package_name: str # llvm-runtime
@@ -34,26 +26,27 @@ class PackageBuildResult(typing.NamedTuple):
 
 
 class BuildManager:
-    def __init__(self, tree, log_dir, cache_dir, build_dir, keep_build_dir):
+    def __init__(self, tree, log_dir, cache_dir, build_dir,
+                 keep_build_dir, log_level=logging.INFO):
         self.tree = tree
         self.log_dir = log_dir
         self.cache_dir = cache_dir
         self.build_dir = build_dir
         self.keep_build_dir = keep_build_dir
+        self.log_level = log_level
 
         os.makedirs(log_dir, exist_ok=True)
         os.makedirs(build_dir, exist_ok=True)
         meta_dir = os.path.join(cache_dir, 'meta')
         os.makedirs(meta_dir, exist_ok=True)
 
+        self.install_logger(self.log_level)
+        self.logger = logging.getLogger('manager')
         tree_fullpath = os.path.abspath(tree.rstrip('/'))
         dbfile = os.path.join(meta_dir, '%s-%s.db' % (
             os.path.basename(tree_fullpath), utils.hashtag(tree_fullpath))
         self.dbfile = dbfile
-
-        repo = abbsmeta.LocalRepo(tree, dbfile)
-        repo.update()
-        self.db = repo.db
+        self.db = None
 
     def install_logger(self, level=logging.INFO):
         root_logger = logging.getLogger()
@@ -65,21 +58,145 @@ class BuildManager:
             '[%(colorlevelname)s]: %(message)s'))
         root_logger.addHandler(str_handler)
         log_file_handler = logging.FileHandler(
-            os.path.join(self.log_loc, 'acbs-build.log'))
+            os.path.join(self.log_loc, 'adbs.log'))
         log_file_handler.setLevel(level)
         log_file_handler.addFilter(utils.ExternalLogFilter())
         log_file_handler.setFormatter(utils.ACBSTextLogFormatter(
             '%(asctime)s [%(levelname).1s:%(name).8s] %(message)s'))
         root_logger.addHandler(log_file_handler)
-        result_logger = logging.getLogger('_result')
-        result_log_handler = logging.FileHandler(
-            os.path.join(self.log_loc, 'build-result.log'))
-        result_log_handler.setLevel(level)
-        result_log_handler.setFormatter(utils.JSONLogFormatter())
-        result_logger.addHandler(result_log_handler)
+        for logger_name in ('_package_result', '_recipe_result'):
+            result_logger = logging.getLogger(logger_name)
+            result_log_handler = logging.FileHandler(
+                os.path.join(self.log_loc, '%s.log' % logger_name))
+            result_log_handler.setLevel(level)
+            result_log_handler.setFormatter(utils.JSONLogFormatter())
+            result_logger.addHandler(result_log_handler)
+
+    def build(self, names):
+        if self.db:
+            self.db.close()
+        repo = abbsmeta.LocalRepo(tree, dbfile)
+        repo.update()
+        self.db = repo.db
+        self.db.enable_load_extension(True)
+        self.db.execute("SELECT load_extension('./mod_vercomp.so')")
+        self.db.enable_load_extension(False)
+
+        recipe = SuiteBuildRecipe(self.tree, self.db, names)
+        self.logger.info('Preparing the build recipe for %s',
+            utils.comma_list(names))
+        recipe.prepare()
 
     def clean_build(self):
         shutil.rmtree(self.build_dir)
+
+
+class SuiteBuildRecipe:
+    def __init__(self, tree, db, names, revdeps=False, solve_circular=True):
+        self.tree = tree
+        self.db = db
+        self.names = names
+        self.revdeps = revdeps
+        self.solve_circular = solve_circular
+
+    def find_package(self, name, try_group=True):
+        cur = self.db.cursor()
+        category = section = directory = None
+        namespl = name.split('/', 1)
+        if len(namespl) == 1:
+            directory = name
+        else:
+            secpath, directory = namespl
+            if any(secpath.startswith(x) for x in abbsmeta.abbs_categories):
+                category, section = secpath.split('-', 1)
+            else:
+                category, section = None, secpath
+        sql = """
+            SELECT
+              coalesce(category || '-', '') || section || '/' || directory
+              AS src_name
+            FROM packages
+            WHERE directory=?
+        """
+        params = [directory]
+        if section:
+            sql += ' AND section=?'
+            params.append(section)
+        if category:
+            sql += ' AND category=?'
+            params.append(category)
+        row = cur.execute(sql, params).fetchone()
+        if row:
+            return row[0], False
+        if section == 'groups' or (try_group and section is None):
+            return directory, True
+        raise ValueError('source package %s not found' % name)
+
+    def find_packages(self, names, group_path=()):
+        src_packages = []
+        groups = []
+        for name in names:
+            result, isgroup = self.find_package(name, not group_path)
+            if isgroup:
+                groups.append(result)
+            else:
+                src_packages.append(result)
+        for group in groups:
+            if group in group_path:
+                raise ValueError(
+                    'group dependency loop found: %s -> %s' % (group_path, group))
+            groupfile = os.path.join(self.tree, 'groups', directory)
+            if os.path.isfile(groupfile):
+                with open(groupfile, 'r', encoding='utf-8') as f:
+                    names = [ln.strip() for ln in f]
+                src_packages.extend(self.find_packages(names, group_path + (group,)))
+            else:
+                raise ValueError('source package %s not found' % group)
+        return src_packages
+
+    def install_deps(self):
+        cur.execute("""
+SELECT d.package, d.dependency
+FROM package_dependencies d
+INNER JOIN v_packages v2 ON v2.name=d.dependency
+AND compare_dpkgrel(v2.full_version, d.relop, d.version)
+WHERE d.relationship IN ('PKGDEP', 'BUILDDEP') AND d.package!=d.dependency
+
+        
+        """)
+
+
+    sobreaks = []
+    circular = None
+    cur = self.repo.db.cursor()
+    cur.execute("SELECT dep_package, deplist FROM v_so_breaks_dep "
+        "WHERE package=%s", (name,))
+    res = {k: set(v) for k, v in cur}
+    try:
+        for level in utils.toposort(res):
+            sobreaks.append(level)
+    except utils.CircularDependencyError as ex:
+        circular = ex.data
+    sobreaks.reverse()
+    if circular:
+        circular = sorted(circular.keys())
+
+
+
+        ...
+
+    def get_sources(self):
+        ...
+
+    def build_list(self):
+        ...
+        # yield group
+
+    #input_names: list
+    #src_packages: list
+    #dependencies: dict
+    #installed: list
+    #build_list: list
 
 
 class PackageBuilder:

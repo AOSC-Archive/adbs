@@ -13,12 +13,18 @@ import posixpath
 import collections
 
 import bashvar
+try:
+    import fossil
+    import reposync
+except ImportError:
+    pass
+
 
 logger = logging.getLogger('abbsmeta')
 
 re_variable = re.compile(b'^\\s*([a-zA-Z_][a-zA-Z0-9_]*)=')
 re_packagerel = re.compile(
-    r'^([a-z0-9][a-z0-9+.-]*)([<>=]=)?([0-9A-Za-z.+~:-]*)$')
+    r'^([a-z0-9][a-z0-9+.-]*)([<>=]=|<<|>>)?([0-9A-Za-z.+~:-]*)$')
 re_commitmsg = re.compile(r'^\[?([a-z0-9][a-z0-9+. ,{}*/-]*)\]?\:? (.+)$', re.M)
 re_commitrevert = re.compile(r'^(?:Revert ")+(.+?)"+$', re.M)
 abbs_categories = frozenset(('core-', 'base-', 'extra-'))
@@ -529,9 +535,6 @@ class LocalRepo:
 class SourceRepo(LocalRepo):
     def __init__(self, name, basepath, markpath, dbfile, mainbranch,
                  branches=None, category='base', url=None, priority=0):
-        import fossil
-        import reposync
-
         # tree name
         if '/' in name:
             raise ValueError("'/' not allowed in name. Use basepath to change directory")
